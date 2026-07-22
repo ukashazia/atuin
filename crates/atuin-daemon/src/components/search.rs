@@ -235,6 +235,9 @@ impl Component for SearchComponent {
             // Events we don't care about
             DaemonEvent::SyncCompleted { .. }
             | DaemonEvent::SyncFailed { .. }
+            | DaemonEvent::ClipboardCaptured(_)
+            | DaemonEvent::ClipboardSynced(_)
+            | DaemonEvent::ClipboardDeleted(_)
             | DaemonEvent::ForceSync
             | DaemonEvent::ShutdownRequested => {}
         }

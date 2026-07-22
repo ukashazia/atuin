@@ -28,6 +28,7 @@ mod unix {
         let key_path = tmp.path().join("key");
         let socket_path = tmp.path().join("test.sock");
         let meta_path = tmp.path().join("meta.db");
+        let clipboard_path = tmp.path().join("clipboard.db");
 
         // Initialize the meta store config for testing (required for Settings::host_id())
         init_meta_config_for_testing(meta_path.to_str().unwrap(), 5.0);
@@ -45,6 +46,8 @@ mod unix {
             .expect("failed to set socket_path")
             .set_override("meta.db_path", meta_path.to_str().unwrap())
             .expect("failed to set meta.db_path")
+            .set_override("clipboard.db_path", clipboard_path.to_str().unwrap())
+            .expect("failed to set clipboard.db_path")
             .build()
             .expect("could not build settings")
             .try_deserialize()

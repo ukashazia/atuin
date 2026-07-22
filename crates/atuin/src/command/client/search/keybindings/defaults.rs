@@ -70,6 +70,7 @@ fn add_common_bindings(km: &mut Keymap) {
     km.bind(key("ctrl-c"), Action::ReturnOriginal);
     km.bind(key("ctrl-g"), Action::ReturnOriginal);
     km.bind(key("ctrl-o"), Action::ToggleTab);
+    km.bind(key("ctrl-v"), Action::SwitchDomain);
 
     // Tab: always returns selection without executing (unlike Enter which respects enter_accept)
     km.bind(key("tab"), Action::ReturnSelection);
@@ -365,6 +366,7 @@ pub fn default_inspector_keymap(settings: &Settings) -> Keymap {
     km.bind(key("ctrl-["), Action::Exit);
     km.bind(key("tab"), Action::ReturnSelection);
     km.bind(key("ctrl-o"), Action::ToggleTab);
+    km.bind(key("ctrl-v"), Action::SwitchDomain);
 
     // Prefix key: ctrl-<prefix_char> → enter prefix mode
     let prefix_char = settings.keys.prefix.chars().next().unwrap_or('a');
@@ -578,6 +580,7 @@ mod tests {
     #[case::ctrl_n_selects_next_no_exit_condition("ctrl-n", 0, 0, 0, 10, Action::SelectNext)]
     #[case::prefix_key_enters_prefix("ctrl-a", 0, 0, 0, 10, Action::EnterPrefixMode)]
     #[case::home_cursor_start("home", 5, 10, 0, 10, Action::CursorStart)]
+    #[case::ctrl_v_switches_domain("ctrl-v", 0, 0, 0, 10, Action::SwitchDomain)]
     fn emacs_keymap_resolves(
         #[case] k: &str,
         #[case] cursor: usize,
@@ -620,6 +623,7 @@ mod tests {
     #[case::screen_jump_bottom("L", 0, 0, 50, 100, Action::ScrollToScreenBottom)]
     // enter_accept=false in test defaults → ReturnSelection
     #[case::enter_returns_selection("enter", 0, 0, 0, 10, Action::ReturnSelection)]
+    #[case::ctrl_v_switches_domain("ctrl-v", 0, 0, 0, 10, Action::SwitchDomain)]
     fn vim_normal_keymap_resolves(
         #[case] k: &str,
         #[case] cursor: usize,
@@ -674,6 +678,7 @@ mod tests {
     // enter_accept=false → ReturnSelection
     #[case::tab_returns_selection("tab", 0, 0, 0, 10, Action::ReturnSelection)]
     #[case::prefix_key_enters_prefix("ctrl-a", 0, 0, 0, 10, Action::EnterPrefixMode)]
+    #[case::ctrl_v_switches_domain("ctrl-v", 0, 0, 0, 10, Action::SwitchDomain)]
     fn inspector_keymap_resolves(
         #[case] k: &str,
         #[case] cursor: usize,

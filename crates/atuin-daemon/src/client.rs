@@ -453,6 +453,9 @@ fn daemon_event_to_proto(event: DaemonEvent) -> crate::control::send_event_reque
         DaemonEvent::HistoryStarted(_)
         | DaemonEvent::HistoryEnded(_)
         | DaemonEvent::HistorySynced(_)
+        | DaemonEvent::ClipboardCaptured(_)
+        | DaemonEvent::ClipboardSynced(_)
+        | DaemonEvent::ClipboardDeleted(_)
         | DaemonEvent::SyncCompleted { .. }
         | DaemonEvent::SyncFailed { .. } => {
             // Use shutdown as a fallback, though this shouldn't happen

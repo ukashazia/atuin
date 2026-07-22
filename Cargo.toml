@@ -20,6 +20,7 @@ readme = "README.md"
 [workspace.dependencies]
 async-trait = "0.1.58"
 atuin-client = { path = "crates/atuin-client", version = "18.18.0-beta.2" }
+atuin-clipboard = { path = "crates/atuin-clipboard", version = "18.18.0-beta.2", default-features = false }
 atuin-common = { path = "crates/atuin-common", version = "18.18.0-beta.2" }
 atuin-daemon = { path = "crates/atuin-daemon", version = "18.18.0-beta.2" }
 atuin-dotfiles = { path = "crates/atuin-dotfiles", version = "18.18.0-beta.2" }

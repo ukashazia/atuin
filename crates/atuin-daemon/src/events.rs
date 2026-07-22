@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use atuin_client::history::{History, HistoryId};
+use atuin_clipboard::ClipboardId;
 
 /// Events that flow through the daemon's event bus.
 ///
@@ -30,6 +31,15 @@ pub enum DaemonEvent {
     /// Must carry an `Arc<[HistoryId]>`.
     /// - These messages get sent across a spmc queue, so we avoid unnecessary clones.
     HistorySynced(Arc<[HistoryId]>),
+
+    /// Clipboard entries materialized after record sync.
+    ClipboardSynced(Arc<[ClipboardId]>),
+
+    /// A clipboard entry was captured by the daemon watcher.
+    ClipboardCaptured(ClipboardId),
+
+    /// A clipboard entry was soft-deleted locally or after sync.
+    ClipboardDeleted(ClipboardId),
 
     /// Sync completed successfully.
     SyncCompleted {

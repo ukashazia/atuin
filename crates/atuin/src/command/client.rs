@@ -16,6 +16,7 @@ mod account;
 #[cfg(feature = "daemon")]
 mod daemon;
 
+mod clipboard;
 mod config;
 mod default_config;
 mod doctor;
@@ -43,6 +44,10 @@ pub enum Cmd {
     /// Manipulate shell history
     #[command(subcommand)]
     History(history::Cmd),
+
+    /// Search and manage system clipboard history
+    #[command(subcommand)]
+    Clipboard(clipboard::Cmd),
 
     /// Manage AI-agent shell hooks
     Hook(hook::Cmd),
@@ -178,7 +183,7 @@ impl Cmd {
         let db_path = &settings.db_path;
         let record_store_path = &settings.record_store_path;
 
-        let db = Sqlite::new(db_path, settings.local_timeout).await?;
+        let mut db = Sqlite::new(db_path, settings.local_timeout).await?;
         let sqlite_store = SqliteStore::new(record_store_path, settings.local_timeout).await?;
 
         let theme_name = settings.theme.name.clone();
@@ -189,6 +194,11 @@ impl Cmd {
             Self::Import(import) => import.run(&db).await,
             Self::Stats(stats) => stats.run(&db, &settings, theme).await,
             Self::Search(search) => search.run(db, &mut settings, sqlite_store, theme).await,
+            Self::Clipboard(clipboard) => {
+                clipboard
+                    .run(&mut db, &settings, &sqlite_store, theme)
+                    .await
+            }
 
             #[cfg(feature = "sync")]
             Self::Sync(sync) => sync.run(settings, &db, sqlite_store).await,

@@ -1,0 +1,41 @@
+[package]
+name = "atuin-clipboard"
+edition = "2024"
+version = { workspace = true }
+description = "Clipboard history domain for Atuin"
+
+authors.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[features]
+default = ["arboard"]
+arboard = ["dep:arboard"]
+
+[dependencies]
+atuin-client = { workspace = true }
+atuin-common = { workspace = true, features = ["tracing"] }
+async-trait = { workspace = true }
+eyre = { workspace = true }
+regex = { workspace = true }
+rmp = "0.8.14"
+sha2 = "0.10"
+sqlx = { workspace = true, features = ["sqlite"] }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+arboard = { version = "3.4", optional = true, default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.4", optional = true, default-features = false, features = [
+  "wayland-data-control",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

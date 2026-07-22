@@ -40,12 +40,13 @@ daemon = ["atuin-client/daemon", "atuin-daemon", "atuin-ai?/daemon"]
 ai = ["atuin-ai"]
 pty-proxy = ["dep:atuin-pty-proxy"]
 hex = ["pty-proxy"]
-clipboard = ["arboard"]
+clipboard = ["arboard", "atuin-clipboard/arboard"]
 check-update = ["atuin-client/check-update"]
 
 [dependencies]
 atuin-ai = { path = "../atuin-ai", version = "18.18.0-beta.2", optional = true, default-features = false }
 atuin-client = { path = "../atuin-client", version = "18.18.0-beta.2", optional = true, default-features = false }
+atuin-clipboard = { workspace = true, default-features = false }
 atuin-common = { workspace = true, features = ["tracing", "unicode"] }
 atuin-dotfiles = { workspace = true }
 atuin-history = { workspace = true }

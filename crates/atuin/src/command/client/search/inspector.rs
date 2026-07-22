@@ -5,6 +5,7 @@ use atuin_client::{
     history::{History, HistoryStats},
     settings::{Settings, Timezone},
 };
+use atuin_clipboard::ClipboardEntry;
 use atuin_common::string::EscapeNonPrintablePosixExt as _;
 use ratatui::{
     Frame,
@@ -13,10 +14,11 @@ use ratatui::{
     prelude::{Constraint, Direction, Layout},
     style::Style,
     text::{Span, Text},
-    widgets::{Bar, BarChart, BarGroup, Block, Borders, Padding, Paragraph, Row, Table},
+    widgets::{Bar, BarChart, BarGroup, Block, Borders, Padding, Paragraph, Row, Table, Wrap},
 };
 
 use super::duration::format_duration;
+use super::item::SearchItem;
 
 use super::super::theme::{Meaning, Theme};
 use super::interactive::{Compactness, to_compactness};
@@ -297,6 +299,84 @@ pub fn draw(
         Compactness::Ultracompact => draw_ultracompact(f, chunk, history, stats, theme),
         _ => draw_full(f, chunk, history, stats, theme, tz),
     }
+}
+
+pub fn draw_item(
+    f: &mut Frame<'_>,
+    chunk: Rect,
+    item: &SearchItem,
+    stats: Option<&HistoryStats>,
+    settings: &Settings,
+    theme: &Theme,
+    tz: Timezone,
+) {
+    match item {
+        SearchItem::History(history) => draw(
+            f,
+            chunk,
+            history,
+            stats.expect("drawing history inspector without history statistics"),
+            settings,
+            theme,
+            tz,
+        ),
+        SearchItem::Clipboard(entry) => draw_clipboard(f, chunk, entry, settings, theme, tz),
+    }
+}
+
+fn draw_clipboard(
+    f: &mut Frame<'_>,
+    chunk: Rect,
+    entry: &ClipboardEntry,
+    settings: &Settings,
+    theme: &Theme,
+    tz: Timezone,
+) {
+    if matches!(to_compactness(f, settings), Compactness::Ultracompact) {
+        f.render_widget(
+            Paragraph::new(entry.content.as_str())
+                .wrap(Wrap { trim: false })
+                .style(Style::from_crossterm(theme.as_style(Meaning::Important))),
+            chunk,
+        );
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
+        .split(chunk);
+    let content = Paragraph::new(entry.content.as_str())
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title("Clipboard content")
+                .borders(Borders::ALL)
+                .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
+                .padding(Padding::horizontal(1)),
+        );
+    f.render_widget(content, layout[0]);
+
+    let rows = [
+        Row::new(vec![
+            "Captured".to_string(),
+            entry.timestamp.to_offset(tz.0).to_string(),
+        ]),
+        Row::new(vec!["Host".to_string(), entry.hostname.clone()]),
+        Row::new(vec!["Bytes".to_string(), entry.byte_len().to_string()]),
+        Row::new(vec!["ID".to_string(), entry.id.to_string()]),
+        Row::new(vec!["MIME type".to_string(), entry.mime_type.clone()]),
+    ];
+    let table = Table::new(rows, [Constraint::Ratio(1, 5), Constraint::Ratio(4, 5)])
+        .column_spacing(1)
+        .block(
+            Block::default()
+                .title("Clipboard metadata")
+                .borders(Borders::ALL)
+                .style(Style::from_crossterm(theme.as_style(Meaning::Base)))
+                .padding(Padding::vertical(1)),
+        );
+    f.render_widget(table, layout[1]);
 }
 
 pub fn draw_ultracompact(

@@ -53,6 +53,7 @@ pub enum Action {
     Redraw,
     CycleFilterMode,
     CycleSearchMode,
+    SwitchDomain,
     SwitchContext,
     ClearContext,
     ToggleTab,
@@ -133,6 +134,7 @@ impl Action {
             "redraw" => Ok(Action::Redraw),
             "cycle-filter-mode" => Ok(Action::CycleFilterMode),
             "cycle-search-mode" => Ok(Action::CycleSearchMode),
+            "switch-domain" => Ok(Action::SwitchDomain),
             "switch-context" => Ok(Action::SwitchContext),
             "clear-context" => Ok(Action::ClearContext),
             "toggle-tab" => Ok(Action::ToggleTab),
@@ -200,6 +202,7 @@ impl Action {
             Action::Redraw => "redraw".to_string(),
             Action::CycleFilterMode => "cycle-filter-mode".to_string(),
             Action::CycleSearchMode => "cycle-search-mode".to_string(),
+            Action::SwitchDomain => "switch-domain".to_string(),
             Action::SwitchContext => "switch-context".to_string(),
             Action::ClearContext => "clear-context".to_string(),
             Action::ToggleTab => "toggle-tab".to_string(),
@@ -249,6 +252,10 @@ mod tests {
         assert_eq!(Action::from_str("cursor-left").unwrap(), Action::CursorLeft);
         assert_eq!(Action::from_str("accept").unwrap(), Action::Accept);
         assert_eq!(Action::from_str("exit").unwrap(), Action::Exit);
+        assert_eq!(
+            Action::from_str("switch-domain").unwrap(),
+            Action::SwitchDomain
+        );
         assert_eq!(Action::from_str("noop").unwrap(), Action::Noop);
         assert_eq!(
             Action::from_str("vim-enter-normal").unwrap(),
@@ -297,6 +304,7 @@ mod tests {
             Action::ReturnSelectionNth(3),
             Action::VimSearchInsert,
             Action::ScrollToScreenMiddle,
+            Action::SwitchDomain,
         ];
         for action in actions {
             let s = action.as_str();

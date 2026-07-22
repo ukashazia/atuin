@@ -14,15 +14,18 @@ use atuin_client::{
     settings::{FilterMode, KeymapMode, SearchMode, Settings, Timezone},
     theme::Theme,
 };
+use atuin_clipboard::{ClipboardDatabase, ClipboardStore};
 
 use super::history::ListMode;
 
-mod cursor;
+mod clipboard_search;
+pub(super) mod cursor;
 mod duration;
 mod engines;
 mod history_list;
 mod inspector;
-mod interactive;
+pub(super) mod interactive;
+mod item;
 pub mod keybindings;
 mod syntax;
 
@@ -170,7 +173,7 @@ impl Cmd {
     #[allow(clippy::too_many_lines)]
     pub async fn run(
         self,
-        db: impl Database,
+        mut db: impl Database,
         settings: &mut Settings,
         store: SqliteStore,
         theme: &Theme,
@@ -241,7 +244,21 @@ impl Cmd {
         let history_store = HistoryStore::new(store.clone(), host_id, encryption_key);
 
         if self.interactive {
-            let item = interactive::history(&query, settings, db, &history_store, theme).await?;
+            let clipboard_database =
+                ClipboardDatabase::new(&settings.clipboard.db_path, settings.local_timeout).await?;
+            let clipboard_store = ClipboardStore::new(store, host_id, encryption_key);
+            let item = interactive::history(
+                &query,
+                settings,
+                &mut db,
+                &history_store,
+                &clipboard_database,
+                &clipboard_store,
+                theme,
+                interactive::SearchDomain::History,
+                atuin_clipboard::SearchOptions::default(),
+            )
+            .await?;
 
             if let Some(result_file) = self.result_file {
                 let mut file = File::create(result_file)?;

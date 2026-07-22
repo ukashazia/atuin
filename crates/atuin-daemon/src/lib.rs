@@ -18,7 +18,9 @@ pub use daemon::{Component, Daemon, DaemonBuilder, DaemonHandle};
 pub use events::DaemonEvent;
 
 // Re-export components
-pub use components::{HistoryComponent, SearchComponent, SemanticComponent, SyncComponent};
+pub use components::{
+    ClipboardComponent, HistoryComponent, SearchComponent, SemanticComponent, SyncComponent,
+};
 
 // Re-export client helpers
 pub use client::{ControlClient, SemanticClient, emit_event, emit_event_with_settings};
@@ -34,6 +36,7 @@ pub async fn boot(
 ) -> Result<()> {
     // Create the components
     let history_component = HistoryComponent::new();
+    let clipboard_component = ClipboardComponent::new();
     let search_component = SearchComponent::new();
     let semantic_component = SemanticComponent::new();
     let sync_component = SyncComponent::new();
@@ -49,6 +52,7 @@ pub async fn boot(
         .store(store)
         .history_db(history_db)
         .component(history_component)
+        .component(clipboard_component)
         .component(search_component)
         .component(semantic_component)
         .component(sync_component)

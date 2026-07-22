@@ -1,10 +1,7 @@
-use std::time::Duration;
-
 use super::duration::format_duration;
-use super::engines::SearchEngine;
+use super::item::SearchItem;
 use super::syntax;
 use atuin_client::{
-    history::History,
     settings::{UiColumn, UiColumnType},
     theme::{Meaning, Theme},
 };
@@ -24,21 +21,19 @@ use ratatui::{
 };
 use time::OffsetDateTime;
 
-pub struct HistoryHighlighter<'a> {
-    pub engine: &'a dyn SearchEngine,
-    pub search_input: &'a str,
+pub struct SearchHighlighter<'a> {
+    pub highlight: &'a dyn Fn(&str) -> Vec<usize>,
 }
 
-impl HistoryHighlighter<'_> {
-    pub fn get_highlight_indices(&self, command: &str) -> Vec<usize> {
-        self.engine
-            .get_highlight_indices(command, self.search_input)
+impl SearchHighlighter<'_> {
+    pub fn get_highlight_indices(&self, content: &str) -> Vec<usize> {
+        (self.highlight)(content)
     }
 }
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct HistoryList<'a> {
-    history: &'a [History],
+    items: &'a [SearchItem],
     block: Option<Block<'a>>,
     inverted: bool,
     /// Apply an alternative highlighting to the selected row
@@ -46,7 +41,7 @@ pub struct HistoryList<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     indicator: &'a str,
     theme: &'a Theme,
-    history_highlighter: HistoryHighlighter<'a>,
+    highlighter: SearchHighlighter<'a>,
     show_numeric_shortcuts: bool,
     syntax_highlight: bool,
     /// Columns to display (in order, after the indicator)
@@ -88,7 +83,7 @@ impl StatefulWidget for HistoryList<'_> {
             inner_area
         });
 
-        if list_area.width < 1 || list_area.height < 1 || self.history.is_empty() {
+        if list_area.width < 1 || list_area.height < 1 || self.items.is_empty() {
             return;
         }
         let list_height = list_area.height as usize;
@@ -108,13 +103,13 @@ impl StatefulWidget for HistoryList<'_> {
             now: &self.now,
             indicator: self.indicator,
             theme: self.theme,
-            history_highlighter: self.history_highlighter,
+            highlighter: self.highlighter,
             show_numeric_shortcuts: self.show_numeric_shortcuts,
             syntax_highlight: self.syntax_highlight,
             columns: self.columns,
         };
 
-        for item in self.history.iter().skip(state.offset).take(end - start) {
+        for item in self.items.iter().skip(state.offset).take(end - start) {
             s.render_row(item);
 
             // reset line
@@ -127,26 +122,26 @@ impl StatefulWidget for HistoryList<'_> {
 impl<'a> HistoryList<'a> {
     #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     pub fn new(
-        history: &'a [History],
+        items: &'a [SearchItem],
         inverted: bool,
         alternate_highlight: bool,
         now: &'a dyn Fn() -> OffsetDateTime,
         indicator: &'a str,
         theme: &'a Theme,
-        history_highlighter: HistoryHighlighter<'a>,
+        highlighter: SearchHighlighter<'a>,
         show_numeric_shortcuts: bool,
         syntax_highlight: bool,
         columns: &'a [UiColumn],
     ) -> Self {
         Self {
-            history,
+            items,
             block: None,
             inverted,
             alternate_highlight,
             now,
             indicator,
             theme,
-            history_highlighter,
+            highlighter,
             show_numeric_shortcuts,
             syntax_highlight,
             columns,
@@ -159,9 +154,9 @@ impl<'a> HistoryList<'a> {
     }
 
     fn get_items_bounds(&self, selected: usize, offset: usize, height: usize) -> (usize, usize) {
-        let offset = offset.min(self.history.len().saturating_sub(1));
+        let offset = offset.min(self.items.len().saturating_sub(1));
 
-        let max_scroll_space = height.min(10).min(self.history.len() - selected);
+        let max_scroll_space = height.min(10).min(self.items.len() - selected);
         if offset + height < selected + max_scroll_space {
             let end = selected + max_scroll_space;
             (end - height, end)
@@ -185,7 +180,7 @@ struct DrawState<'a> {
     now: &'a dyn Fn() -> OffsetDateTime,
     indicator: &'a str,
     theme: &'a Theme,
-    history_highlighter: HistoryHighlighter<'a>,
+    highlighter: SearchHighlighter<'a>,
     show_numeric_shortcuts: bool,
     syntax_highlight: bool,
     columns: &'a [UiColumn],
@@ -197,7 +192,7 @@ static SLICES: &str = " > 1 2 3 4 5 6 7 8 9   ";
 
 impl DrawState<'_> {
     /// Render a complete row for a history item based on configured columns.
-    fn render_row(&mut self, h: &History) {
+    fn render_row(&mut self, item: &SearchItem) {
         // Always render the indicator first (width 3)
         self.index();
 
@@ -227,14 +222,14 @@ impl DrawState<'_> {
                 column.width
             };
             match column.column_type {
-                UiColumnType::Duration => self.duration(h, width),
-                UiColumnType::Time => self.time(h, width),
-                UiColumnType::Datetime => self.datetime(h, width),
-                UiColumnType::Directory => self.directory(h, width),
-                UiColumnType::Host => self.host(h, width),
-                UiColumnType::User => self.user(h, width),
-                UiColumnType::Exit => self.exit_code(h, width),
-                UiColumnType::Command => self.command(h, width),
+                UiColumnType::Duration => self.duration(item, width),
+                UiColumnType::Time => self.time(item, width),
+                UiColumnType::Datetime => self.datetime(item, width),
+                UiColumnType::Directory => self.directory(item, width),
+                UiColumnType::Host => self.host(item, width),
+                UiColumnType::User => self.user(item, width),
+                UiColumnType::Exit => self.exit_code(item, width),
+                UiColumnType::Command => self.command(item, width),
             }
         }
     }
@@ -262,13 +257,16 @@ impl DrawState<'_> {
         self.draw(prompt, Style::default());
     }
 
-    fn duration(&mut self, h: &History, width: u16) {
-        let style = self.theme.as_style(if h.success() {
+    fn duration(&mut self, item: &SearchItem, width: u16) {
+        let Some(duration) = item.duration() else {
+            self.blank(width);
+            return;
+        };
+        let style = self.theme.as_style(if item.success().unwrap_or_default() {
             Meaning::AlertInfo
         } else {
             Meaning::AlertError
         });
-        let duration = Duration::from_nanos(u64::try_from(h.duration).unwrap_or(0));
         let formatted = format_duration(duration);
         let w = width as usize;
         // Right-align within the column, ellipsizing if it somehow overflows.
@@ -281,7 +279,7 @@ impl DrawState<'_> {
         self.draw(&display, Style::from_crossterm(style));
     }
 
-    fn time(&mut self, h: &History, width: u16) {
+    fn time(&mut self, item: &SearchItem, width: u16) {
         let style = self.theme.as_style(Meaning::Guidance);
 
         // Account for the chance that h.timestamp is "in the future"
@@ -289,7 +287,7 @@ impl DrawState<'_> {
         // would fail.
         // If the timestamp would otherwise be in the future, display
         // the time since as 0.
-        let since = (self.now)() - h.timestamp;
+        let since = (self.now)() - item.timestamp();
         let time = format_duration(since.try_into().unwrap_or_default());
 
         // Format as "Xs ago" right-aligned within column width
@@ -305,7 +303,7 @@ impl DrawState<'_> {
         self.draw(&display, Style::from_crossterm(style));
     }
 
-    fn command(&mut self, h: &History, _width: u16) {
+    fn command(&mut self, item: &SearchItem, _width: u16) {
         let mut style = self.theme.as_style(Meaning::Base);
         let mut row_highlighted = false;
         if !self.alternate_highlight && (self.y as usize + self.state.offset == self.state.selected)
@@ -317,17 +315,21 @@ impl DrawState<'_> {
         }
 
         // Build the normalized command string (whitespace-collapsed, control chars escaped)
-        let normalized: String = h
-            .command
+        let normalized: String = item
+            .content()
             .escape_non_printable()
             .split_ascii_whitespace()
             .join(" ");
 
-        let highlight_indices = self.history_highlighter.get_highlight_indices(&normalized);
+        let highlight_indices = self.highlighter.get_highlight_indices(&normalized);
 
         // The selected row keeps its single highlight color.
         let syntax = if self.syntax_highlight && !row_highlighted {
-            syntax::classify(&normalized, h.shell.as_deref())
+            syntax::classify(
+                &normalized,
+                item.as_history()
+                    .and_then(|history| history.shell.as_deref()),
+            )
         } else {
             Vec::new()
         };
@@ -365,11 +367,11 @@ impl DrawState<'_> {
     }
 
     /// Render the absolute datetime column (e.g., "2025-01-22 14:35")
-    fn datetime(&mut self, h: &History, width: u16) {
+    fn datetime(&mut self, item: &SearchItem, width: u16) {
         let style = self.theme.as_style(Meaning::Annotation);
         // Format: YYYY-MM-DD HH:MM
-        let formatted = h
-            .timestamp
+        let formatted = item
+            .timestamp()
             .format(
                 &time::format_description::parse_borrowed::<1>(
                     "[year]-[month]-[day] [hour]:[minute]",
@@ -388,10 +390,13 @@ impl DrawState<'_> {
     }
 
     /// Render the directory column (working directory, truncated)
-    fn directory(&mut self, h: &History, width: u16) {
+    fn directory(&mut self, item: &SearchItem, width: u16) {
         let style = self.theme.as_style(Meaning::Annotation);
         let w = width as usize;
-        let cwd = &h.cwd;
+        let Some(cwd) = item.directory() else {
+            self.blank(width);
+            return;
+        };
         // Elide from the left with "…" so the leaf directory stays visible;
         // pad to the column width when it already fits.
         let display = cwd.pad_ellipsize(
@@ -404,11 +409,10 @@ impl DrawState<'_> {
     }
 
     /// Render the host column (just the hostname)
-    fn host(&mut self, h: &History, width: u16) {
+    fn host(&mut self, item: &SearchItem, width: u16) {
         let style = self.theme.as_style(Meaning::Annotation);
         let w = width as usize;
-        // Database stores hostname as "hostname:username"
-        let host = h.hostname.split(':').next().unwrap_or(&h.hostname);
+        let host = item.host();
         let display = host.pad_ellipsize(
             Measure::Columns(w),
             Pos::End,
@@ -419,11 +423,13 @@ impl DrawState<'_> {
     }
 
     /// Render the user column
-    fn user(&mut self, h: &History, width: u16) {
+    fn user(&mut self, item: &SearchItem, width: u16) {
         let style = self.theme.as_style(Meaning::Annotation);
         let w = width as usize;
-        // Database stores hostname as "hostname:username"
-        let user = h.hostname.split(':').nth(1).unwrap_or("");
+        let Some(user) = item.user() else {
+            self.blank(width);
+            return;
+        };
         let display = user.pad_ellipsize(
             Measure::Columns(w),
             Pos::End,
@@ -434,15 +440,27 @@ impl DrawState<'_> {
     }
 
     /// Render the exit code column
-    fn exit_code(&mut self, h: &History, width: u16) {
-        let style = if h.success() {
+    fn exit_code(&mut self, item: &SearchItem, width: u16) {
+        let Some(exit) = item.exit() else {
+            self.blank(width);
+            return;
+        };
+        let style = if item.success().unwrap_or_default() {
             self.theme.as_style(Meaning::AlertInfo)
         } else {
             self.theme.as_style(Meaning::AlertError)
         };
         let w = width as usize;
-        let display = format!("{:>w$}", h.exit);
+        let display = format!("{exit:>w$}");
         self.draw(&display, Style::from_crossterm(style));
+    }
+
+    fn blank(&mut self, width: u16) {
+        let display = " ".repeat(width.into());
+        self.draw(
+            &display,
+            Style::from_crossterm(self.theme.as_style(Meaning::Annotation)),
+        );
     }
 
     fn draw(&mut self, s: &str, mut style: Style) {
