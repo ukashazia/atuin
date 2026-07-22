@@ -3280,7 +3280,7 @@ mod tests {
 
         let escape =
             state.handle_key_input(&settings, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(matches!(escape, super::InputAction::ReturnOriginal));
+        assert!(matches!(escape, super::InputAction::ReturnQuery));
     }
 
     #[test]
