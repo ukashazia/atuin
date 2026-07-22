@@ -8,12 +8,13 @@
 //! - [`Daemon`]: The main daemon orchestrator
 //! - [`DaemonBuilder`]: Builder for constructing and configuring the daemon
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use atuin_client::{
     database::Sqlite as HistoryDatabase, encryption, record::sqlite_store::SqliteStore,
     settings::Settings,
 };
+use atuin_clipboard::ClipboardDatabase;
 use eyre::{Context, Result};
 use tokio::sync::{RwLock, broadcast};
 
@@ -39,6 +40,7 @@ pub struct DaemonState {
 
     // Database handles
     history_db: HistoryDatabase,
+    clipboard_db: StdRwLock<Option<ClipboardDatabase>>,
     store: SqliteStore,
 }
 
@@ -143,6 +145,32 @@ impl DaemonHandle {
     /// Get a reference to the history database.
     pub fn history_db(&self) -> &HistoryDatabase {
         &self.state.history_db
+    }
+
+    /// Get or initialize the materialized clipboard database.
+    ///
+    /// Clipboard database failures are isolated from the rest of the daemon so
+    /// shell history capture and sync can continue normally.
+    pub async fn ensure_clipboard_db(&self) -> Result<ClipboardDatabase> {
+        if let Some(database) = self
+            .state
+            .clipboard_db
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(database);
+        }
+        let settings = self.settings().await;
+        let database = ClipboardDatabase::new(&settings.clipboard.db_path, settings.local_timeout)
+            .await
+            .context("could not initialize clipboard database")?;
+        *self
+            .state
+            .clipboard_db
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(database.clone());
+        Ok(database)
     }
 
     /// Get a reference to the record store.
@@ -429,6 +457,18 @@ impl DaemonBuilder {
         let history_db = self
             .history_db
             .ok_or_else(|| eyre::eyre!("history_db is required"))?;
+        let clipboard_db = match ClipboardDatabase::new(
+            &self.settings.clipboard.db_path,
+            self.settings.local_timeout,
+        )
+        .await
+        {
+            Ok(database) => Some(database),
+            Err(error) => {
+                tracing::warn!(%error, "clipboard database unavailable; clipboard features will retry");
+                None
+            }
+        };
 
         // Load encryption key
         let encryption_key: [u8; 32] = encryption::load_key(&self.settings)
@@ -444,6 +484,7 @@ impl DaemonBuilder {
             settings: RwLock::new(self.settings),
             encryption_key,
             history_db,
+            clipboard_db: StdRwLock::new(clipboard_db),
             store,
         });
 

@@ -15,6 +15,7 @@ use atuin_client::{
     record::sync,
     settings::Settings,
 };
+use atuin_clipboard::{ClipboardStore, MaterializedEvent};
 use atuin_dotfiles::store::{AliasStore, var::VarStore};
 
 use crate::{
@@ -128,6 +129,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
     // Create the stores we need
     let encryption_key = *handle.encryption_key();
     let history_store = HistoryStore::new(handle.store().clone(), host_id, encryption_key);
+    let clipboard_store = ClipboardStore::new(handle.store().clone(), host_id, encryption_key);
     let alias_store = AliasStore::new(handle.store().clone(), host_id, encryption_key);
     let var_store = VarStore::new(handle.store().clone(), host_id, encryption_key);
 
@@ -157,6 +159,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
                 sync_state = do_sync_tick(
                     &handle,
                     &history_store,
+                    &clipboard_store,
                     &alias_store,
                     &var_store,
                     &mut ticker,
@@ -172,6 +175,7 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
                         sync_state = do_sync_tick(
                             &handle,
                             &history_store,
+                            &clipboard_store,
                             &alias_store,
                             &var_store,
                             &mut ticker,
@@ -192,9 +196,14 @@ async fn sync_loop(handle: DaemonHandle, mut cmd_rx: mpsc::Receiver<SyncCommand>
 /// Execute a single sync tick.
 ///
 /// Returns the new sync state: `Idle` on success, `Retrying` on failure.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sync tick coordinates the existing domain stores without introducing a speculative aggregate"
+)]
 async fn do_sync_tick(
     handle: &DaemonHandle,
     history_store: &HistoryStore,
+    clipboard_store: &ClipboardStore,
     alias_store: &AliasStore,
     var_store: &VarStore,
     ticker: &mut time::Interval,
@@ -282,6 +291,34 @@ async fn do_sync_tick(
                 if let Some(e) = failure {
                     tracing::error!("failed to build history from downloaded records: {e}");
                     break;
+                }
+            }
+
+            let clipboard_materialization = match handle.ensure_clipboard_db().await {
+                Ok(database) => {
+                    clipboard_store
+                        .incremental_build(&database, &downloaded_records)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match clipboard_materialization {
+                Ok(events) => {
+                    let mut created = Vec::new();
+                    for event in events {
+                        match event {
+                            MaterializedEvent::Created(id) => created.push(id),
+                            MaterializedEvent::Deleted(id) => {
+                                handle.emit(DaemonEvent::ClipboardDeleted(id));
+                            }
+                        }
+                    }
+                    if !created.is_empty() {
+                        handle.emit(DaemonEvent::ClipboardSynced(created.into()));
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to materialize clipboard records");
                 }
             }
 

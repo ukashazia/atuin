@@ -287,6 +287,20 @@
 ## The port that should be used for TCP on non unix systems
 # tcp_port = 8889
 
+## Clipboard history is opt-in because copied text can include passwords,
+## tokens, private messages, and other sensitive data. Synchronized records are
+## end-to-end encrypted, but local processes and users with access to this
+## machine can read the materialized clipboard database.
+[clipboard]
+# enabled = false
+# db_path = "~/.local/share/atuin/clipboard.db"
+# poll_interval_ms = 500
+# max_bytes = 262144
+# retention_days = 0
+# capture_empty = false
+# secrets_filter = true
+# exclude = []
+
 # [theme]
 ## Color theme to use for rendering in the terminal.
 ## There are some built-in themes, including the base theme ("default"),

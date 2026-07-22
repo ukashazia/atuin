@@ -6,6 +6,9 @@ use std::{
 #[cfg(unix)]
 use std::io::Read as _;
 
+use atuin_clipboard::{
+    ArboardBackend, ClipboardDatabase, ClipboardStore, SearchOptions as ClipboardSearchOptions,
+};
 use atuin_common::{shell::Shell, string::EscapeNonPrintablePosixExt as _};
 use eyre::Result;
 use futures_util::FutureExt;
@@ -14,9 +17,11 @@ use time::OffsetDateTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
+    clipboard_search::ClipboardSearch,
     cursor::Cursor,
     engines::{SearchEngine, SearchState},
     history_list::{HistoryList, ListState},
+    item::SearchItem,
 };
 use atuin_client::{
     database::{Context, Database, current_context},
@@ -27,7 +32,7 @@ use atuin_client::{
     },
 };
 
-use crate::command::client::search::history_list::HistoryHighlighter;
+use crate::command::client::search::history_list::SearchHighlighter;
 use crate::command::client::search::keybindings::KeymapSet;
 use crate::command::client::theme::{Meaning, Theme};
 use crate::{VERSION, command::client::search::engines};
@@ -67,7 +72,40 @@ pub enum InputAction {
     ReturnQuery,
     Continue,
     Redraw,
+    SwitchDomain,
     SwitchContext(Option<usize>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::command::client) enum SearchDomain {
+    History,
+    Clipboard,
+}
+
+#[derive(Clone)]
+struct SearchScope {
+    filter_mode: FilterMode,
+    context: Context,
+    custom_context: Option<HistoryId>,
+    context_active: bool,
+}
+
+impl SearchScope {
+    fn capture(search: &SearchState, context_active: bool) -> Self {
+        Self {
+            filter_mode: search.filter_mode,
+            context: search.context.clone(),
+            custom_context: search.custom_context.clone(),
+            context_active,
+        }
+    }
+
+    fn apply(self, search: &mut SearchState) -> bool {
+        search.filter_mode = self.filter_mode;
+        search.context = self.context;
+        search.custom_context = self.custom_context;
+        self.context_active
+    }
 }
 
 #[derive(Clone)]
@@ -129,6 +167,9 @@ pub struct State {
     tab_index: usize,
     pending_vim_key: Option<char>,
     original_input_empty: bool,
+    domain: SearchDomain,
+    context_active: bool,
+    inactive_scope: SearchScope,
 
     pub inspecting_state: InspectingState,
 
@@ -153,11 +194,33 @@ struct StyleState {
 }
 
 impl State {
-    async fn query_results(
+    fn switch_domain(&mut self) {
+        let active_scope = SearchScope::capture(&self.search, self.context_active);
+        let inactive_scope = std::mem::replace(&mut self.inactive_scope, active_scope);
+        self.context_active = inactive_scope.apply(&mut self.search);
+        self.domain = match self.domain {
+            SearchDomain::History => SearchDomain::Clipboard,
+            SearchDomain::Clipboard => SearchDomain::History,
+        };
+        self.inspecting_state.reset();
+    }
+
+    fn set_results_len(&mut self, len: usize, reset_selection: bool) {
+        self.results_len = len;
+        if reset_selection {
+            self.results_state.select(0);
+        } else {
+            self.results_state
+                .select(self.results_state.selected().min(len.saturating_sub(1)));
+        }
+    }
+
+    async fn query_history_results(
         &mut self,
         db: &mut dyn Database,
         smart_sort: bool,
-    ) -> Result<Vec<History>> {
+        reset_selection: bool,
+    ) -> Result<Vec<SearchItem>> {
         let results = self.engine.query(&self.search, db).await?;
 
         self.inspecting_state = InspectingState {
@@ -165,16 +228,47 @@ impl State {
             next: None,
             previous: None,
         };
-        self.results_state.select(0);
-        self.results_len = results.len();
+        self.set_results_len(results.len(), reset_selection);
 
-        if smart_sort {
-            Ok(atuin_history::sort::sort(
-                self.search.input.as_str(),
-                results,
-            ))
+        let results = if smart_sort {
+            atuin_history::sort::sort(self.search.input.as_str(), results)
         } else {
-            Ok(results)
+            results
+        };
+        Ok(results.into_iter().map(SearchItem::from).collect())
+    }
+
+    async fn query_active_results(
+        &mut self,
+        history_database: &mut dyn Database,
+        clipboard_database: &ClipboardDatabase,
+        clipboard_search: &mut ClipboardSearch,
+        smart_sort: bool,
+        reset_selection: bool,
+    ) -> Result<Vec<SearchItem>> {
+        if self.domain == SearchDomain::History {
+            self.query_history_results(history_database, smart_sort, reset_selection)
+                .await
+        } else {
+            let hostname = self
+                .search
+                .context
+                .hostname
+                .split(':')
+                .next()
+                .unwrap_or(&self.search.context.hostname);
+            let results = clipboard_search
+                .query(
+                    clipboard_database,
+                    self.search.input.as_str(),
+                    self.search_mode,
+                    self.search.filter_mode,
+                    hostname,
+                )
+                .await?;
+            self.inspecting_state.reset();
+            self.set_results_len(results.len(), reset_selection);
+            Ok(results.into_iter().map(SearchItem::from).collect())
         }
     }
 
@@ -296,6 +390,15 @@ impl State {
             return InputAction::Continue;
         }
 
+        if self.domain == SearchDomain::Clipboard && input.code == event::KeyCode::Enter {
+            self.accept = true;
+            return if self.tab_index == 1 {
+                InputAction::AcceptInspecting
+            } else {
+                InputAction::Accept(self.results_state.selected())
+            };
+        }
+
         // Reset switched_search_mode at start of each key event
         self.switched_search_mode = false;
 
@@ -307,7 +410,7 @@ impl State {
             selected_index: self.results_state.selected(),
             results_len: self.results_len,
             original_input_empty: self.original_input_empty,
-            has_context: self.search.custom_context.is_some(),
+            has_context: self.context_active,
         };
 
         // Convert KeyEvent to SingleKey
@@ -653,7 +756,14 @@ impl State {
             Action::Exit => Self::handle_key_exit(settings),
             Action::Redraw => InputAction::Redraw,
             Action::CycleFilterMode => {
-                self.search.rotate_filter_mode(settings, 1);
+                if self.domain == SearchDomain::History {
+                    self.search.rotate_filter_mode(settings, 1);
+                } else {
+                    self.search.filter_mode = match self.search.filter_mode {
+                        FilterMode::Global => FilterMode::Host,
+                        _ => FilterMode::Global,
+                    };
+                }
                 InputAction::Continue
             }
             Action::CycleSearchMode => {
@@ -662,6 +772,7 @@ impl State {
                 self.engine = engines::engine(self.search_mode, settings);
                 InputAction::Continue
             }
+            Action::SwitchDomain => InputAction::SwitchDomain,
             Action::SwitchContext => {
                 InputAction::SwitchContext(Some(self.results_state.selected()))
             }
@@ -719,11 +830,19 @@ impl State {
 
             // -- Inspector --
             Action::InspectPrevious => {
-                self.inspecting_state.move_to_previous();
+                if self.domain == SearchDomain::Clipboard {
+                    self.scroll_up(1);
+                } else {
+                    self.inspecting_state.move_to_previous();
+                }
                 InputAction::Redraw
             }
             Action::InspectNext => {
-                self.inspecting_state.move_to_next();
+                if self.domain == SearchDomain::Clipboard {
+                    self.scroll_down(1);
+                } else {
+                    self.inspecting_state.move_to_next();
+                }
                 InputAction::Redraw
             }
 
@@ -736,7 +855,7 @@ impl State {
     #[allow(clippy::bool_to_int_with_if)]
     fn calc_preview_height(
         settings: &Settings,
-        results: &[History],
+        results: &[SearchItem],
         selected: usize,
         tab_index: usize,
         compactness: Compactness,
@@ -748,10 +867,10 @@ impl State {
             && tab_index == 0
             && !results.is_empty()
         {
-            let length_current_cmd = results[selected].command.len() as u16;
+            let length_current_cmd = results[selected].content().len() as u16;
             // calculate the number of newlines in the command
             let num_newlines = results[selected]
-                .command
+                .content()
                 .chars()
                 .filter(|&c| c == '\n')
                 .count() as u16;
@@ -759,7 +878,7 @@ impl State {
                 std::cmp::min(
                     settings.max_preview_height,
                     results[selected]
-                        .command
+                        .content()
                         .split('\n')
                         .map(|line| {
                             (line.len() as u16 + preview_width - 1 - border_size)
@@ -782,13 +901,11 @@ impl State {
             && settings.preview.strategy == PreviewStrategy::Static
             && tab_index == 0
         {
-            let longest_command = results
-                .iter()
-                .max_by(|h1, h2| h1.command.len().cmp(&h2.command.len()));
+            let longest_command = results.iter().max_by_key(|item| item.content().len());
             longest_command.map_or(0, |v| {
                 std::cmp::min(
                     settings.max_preview_height,
-                    v.command
+                    v.content()
                         .split('\n')
                         .map(|line| {
                             (line.len() as u16 + preview_width - 1 - border_size)
@@ -812,7 +929,8 @@ impl State {
     fn draw(
         &mut self,
         f: &mut Frame,
-        results: &[History],
+        results: &[SearchItem],
+        clipboard_count: u64,
         stats: Option<HistoryStats>,
         inspecting: Option<&History>,
         settings: &Settings,
@@ -823,7 +941,16 @@ impl State {
         if popup_mode {
             f.render_widget(Clear, area);
         }
-        self.draw_inner(f, area, results, stats, inspecting, settings, theme);
+        self.draw_inner(
+            f,
+            area,
+            results,
+            clipboard_count,
+            stats,
+            inspecting,
+            settings,
+            theme,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -833,7 +960,8 @@ impl State {
         &mut self,
         f: &mut Frame,
         area: Rect,
-        results: &[History],
+        results: &[SearchItem],
+        clipboard_count: u64,
         stats: Option<HistoryStats>,
         inspecting: Option<&History>,
         settings: &Settings,
@@ -940,7 +1068,7 @@ impl State {
         let help = self.build_help(settings, theme);
         f.render_widget(help, header_chunks[1]);
 
-        let stats_tab = self.build_stats(theme);
+        let stats_tab = self.build_stats(theme, clipboard_count);
         f.render_widget(stats_tab, header_chunks[2]);
 
         let indicator: String = match compactness {
@@ -964,9 +1092,20 @@ impl State {
 
         match self.tab_index {
             0 => {
-                let history_highlighter = HistoryHighlighter {
-                    engine: self.engine.as_ref(),
-                    search_input: self.search.input.as_str(),
+                let highlight = |content: &str| {
+                    if self.domain == SearchDomain::History {
+                        self.engine
+                            .get_highlight_indices(content, self.search.input.as_str())
+                    } else {
+                        super::clipboard_search::highlight_indices(
+                            self.search_mode,
+                            content,
+                            self.search.input.as_str(),
+                        )
+                    }
+                };
+                let highlighter = SearchHighlighter {
+                    highlight: &highlight,
                 };
                 let results_list = Self::build_results_list(
                     style,
@@ -975,7 +1114,7 @@ impl State {
                     &self.now,
                     indicator.as_str(),
                     theme,
-                    history_highlighter,
+                    highlighter,
                     settings.show_numeric_shortcuts,
                     settings.ui.syntax_highlight,
                     &settings.ui.columns,
@@ -995,16 +1134,22 @@ impl State {
                         )
                         .alignment(Alignment::Center);
                     f.render_widget(message, results_list_chunk);
-                } else {
-                    let inspecting = match inspecting {
-                        Some(inspecting) => inspecting,
-                        None => &results[self.results_state.selected()],
-                    };
+                } else if let Some(inspecting) = inspecting {
                     super::inspector::draw(
                         f,
                         results_list_chunk,
                         inspecting,
-                        &stats.expect("Drawing inspector, but no stats"),
+                        &stats.expect("drawing history inspector without statistics"),
+                        settings,
+                        theme,
+                        settings.timezone,
+                    );
+                } else {
+                    super::inspector::draw_item(
+                        f,
+                        results_list_chunk,
+                        &results[self.results_state.selected()],
+                        stats.as_ref(),
                         settings,
                         theme,
                         settings.timezone,
@@ -1109,6 +1254,16 @@ impl State {
 
     #[allow(clippy::unused_self)]
     fn build_help(&self, settings: &Settings, theme: &Theme) -> Paragraph<'_> {
+        if self.domain == SearchDomain::Clipboard {
+            let help = if self.tab_index == 0 {
+                "<esc>: exit, <enter>: restore, <ctrl-v>: history, <ctrl-o>: inspect"
+            } else {
+                "<esc>: exit, <ctrl-v>: history, <ctrl-o>: search, <ctrl-d>: delete"
+            };
+            return Paragraph::new(help)
+                .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
+                .alignment(Alignment::Center);
+        }
         match self.tab_index {
             // search
             0 => Paragraph::new(Text::from(Line::from(vec![
@@ -1124,6 +1279,9 @@ impl State {
                 } else {
                     ": edit"
                 }),
+                Span::raw(", "),
+                Span::styled("<ctrl-v>", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(": clipboard"),
                 Span::raw(", "),
                 Span::styled("<ctrl-o>", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(": inspect"),
@@ -1146,24 +1304,26 @@ impl State {
         .alignment(Alignment::Center)
     }
 
-    fn build_stats(&self, theme: &Theme) -> Paragraph<'_> {
-        Paragraph::new(Text::from(Span::raw(format!(
-            "history count: {}",
-            self.history_count,
-        ))))
-        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
-        .alignment(Alignment::Right)
+    fn build_stats(&self, theme: &Theme, clipboard_count: u64) -> Paragraph<'_> {
+        let stats = if self.domain == SearchDomain::Clipboard {
+            format!("clipboard count: {clipboard_count}")
+        } else {
+            format!("history count: {}", self.history_count)
+        };
+        Paragraph::new(Text::from(Span::raw(stats)))
+            .style(Style::from_crossterm(theme.as_style(Meaning::Annotation)))
+            .alignment(Alignment::Right)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_results_list<'a>(
         style: StyleState,
-        results: &'a [History],
+        results: &'a [SearchItem],
         keymap_mode: KeymapMode,
         now: &'a dyn Fn() -> OffsetDateTime,
         indicator: &'a str,
         theme: &'a Theme,
-        history_highlighter: HistoryHighlighter<'a>,
+        highlighter: SearchHighlighter<'a>,
         show_numeric_shortcuts: bool,
         syntax_highlight: bool,
         columns: &'a [UiColumn],
@@ -1175,7 +1335,7 @@ impl State {
             now,
             indicator,
             theme,
-            history_highlighter,
+            highlighter,
             show_numeric_shortcuts,
             syntax_highlight,
             columns,
@@ -1203,14 +1363,20 @@ impl State {
     }
 
     fn build_input(&self, style: StyleState, prefix_width: u16) -> Paragraph<'_> {
-        let (pref, mode) = if self.prefix {
-            ("", "PREFIX")
+        let (pref, mode) = if self.domain == SearchDomain::Clipboard {
+            if self.switched_search_mode {
+                ("", format!("CLIP:{}", self.search_mode.as_str()))
+            } else {
+                ("", format!("CLIP:{}", self.search.filter_mode.as_str()))
+            }
+        } else if self.prefix {
+            ("", "PREFIX".to_owned())
         } else if self.switched_search_mode {
-            (" SRCH:", self.search_mode.as_str())
+            (" SRCH:", self.search_mode.as_str().to_owned())
         } else if self.search.custom_context.is_some() {
-            (" CTX:", self.search.filter_mode.as_str())
+            (" CTX:", self.search.filter_mode.as_str().to_owned())
         } else {
-            ("", self.search.filter_mode.as_str())
+            ("", self.search.filter_mode.as_str().to_owned())
         };
         // 3: surrounding "[" "] "
         let mode_width = usize::from(prefix_width) - pref.len() - 3;
@@ -1241,7 +1407,7 @@ impl State {
 
     fn build_preview(
         &self,
-        results: &[History],
+        results: &[SearchItem],
         compactness: Compactness,
         preview_width: u16,
         chunk_width: usize,
@@ -1251,7 +1417,20 @@ impl State {
         let command = if results.is_empty() {
             String::new()
         } else {
-            let s = &results[selected].command;
+            let item = &results[selected];
+            if matches!(item, SearchItem::Clipboard(_)) {
+                return match compactness {
+                    Compactness::Full => Paragraph::new(item.content().to_owned()).block(
+                        Block::default()
+                            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                            .border_type(BorderType::Rounded)
+                            .title(format!("{:─>width$}", "", width = chunk_width - 2)),
+                    ),
+                    _ => Paragraph::new(item.content().to_owned())
+                        .style(Style::from_crossterm(theme.as_style(Meaning::Annotation))),
+                };
+            }
+            let s = item.content();
             let mut lines = Vec::new();
             for line in s.split('\n') {
                 let line = line.escape_non_printable();
@@ -1616,14 +1795,19 @@ fn compute_popup_placement(
 #[allow(
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     clippy::cognitive_complexity
 )]
 pub async fn history(
     query: &[String],
     settings: &Settings,
-    mut db: impl Database,
+    db: &mut impl Database,
     history_store: &HistoryStore,
+    clipboard_database: &ClipboardDatabase,
+    clipboard_store: &ClipboardStore,
     theme: &Theme,
+    initial_domain: SearchDomain,
+    clipboard_options: ClipboardSearchOptions,
 ) -> Result<String> {
     let inline_height = if settings.shell_up_key_binding {
         settings
@@ -1772,6 +1956,32 @@ pub async fn history(
         .filter_mode_shell_up_key_binding
         .filter(|_| settings.shell_up_key_binding)
         .unwrap_or_else(|| settings.default_filter_mode(initial_context.git_root.is_some()));
+
+    let history_scope = SearchScope {
+        filter_mode: default_filter_mode,
+        context: initial_context.clone(),
+        custom_context: None,
+        context_active: false,
+    };
+    let mut clipboard_context = initial_context.clone();
+    let clipboard_context_active = clipboard_options.host.is_some();
+    if let Some(host) = clipboard_options.host.as_ref() {
+        clipboard_context.hostname.clone_from(host);
+    }
+    let clipboard_scope = SearchScope {
+        filter_mode: if clipboard_context_active {
+            FilterMode::Host
+        } else {
+            FilterMode::Global
+        },
+        context: clipboard_context,
+        custom_context: None,
+        context_active: clipboard_context_active,
+    };
+    let (active_scope, inactive_scope) = match initial_domain {
+        SearchDomain::History => (history_scope, clipboard_scope),
+        SearchDomain::Clipboard => (clipboard_scope, history_scope),
+    };
     let mut app = State {
         history_count,
         results_state: ListState::default(),
@@ -1787,9 +1997,9 @@ pub async fn history(
         keymaps: KeymapSet::from_settings(settings),
         search: SearchState {
             input,
-            filter_mode: default_filter_mode,
-            context: initial_context.clone(),
-            custom_context: None,
+            filter_mode: active_scope.filter_mode,
+            context: active_scope.context,
+            custom_context: active_scope.custom_context,
         },
         engine: engines::engine(search_mode, settings),
         results_len: 0,
@@ -1808,11 +2018,24 @@ pub async fn history(
         prefix: false,
         pending_vim_key: None,
         original_input_empty: original_query.is_empty(),
+        domain: initial_domain,
+        context_active: active_scope.context_active,
+        inactive_scope,
     };
 
     app.initialize_keymap_cursor(settings);
 
-    let mut results = app.query_results(&mut db, settings.smart_sort).await?;
+    let mut clipboard_search = ClipboardSearch::new(clipboard_options);
+    let mut results = app
+        .query_active_results(
+            db,
+            clipboard_database,
+            &mut clipboard_search,
+            settings.smart_sort,
+            true,
+        )
+        .await?;
+    let mut clipboard_count = clipboard_database.count_active().await?;
 
     if inline_height > 0 && !popup_mode {
         terminal.clear()?;
@@ -1826,6 +2049,7 @@ pub async fn history(
             app.draw(
                 f,
                 &results,
+                clipboard_count,
                 stats.clone(),
                 inspecting.as_ref(),
                 settings,
@@ -1838,6 +2062,8 @@ pub async fn history(
         let initial_filter_mode = app.search.filter_mode;
         let initial_search_mode = app.search_mode;
         let initial_custom_context = app.search.custom_context.clone();
+        let initial_domain = app.domain;
+        let initial_context_active = app.context_active;
 
         let event_ready = tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(250)));
 
@@ -1848,60 +2074,132 @@ pub async fn history(
                         match app.handle_input(settings, &event::read()?) {
                             InputAction::Continue => {},
                             InputAction::Delete(index) => {
-                                if results.is_empty() {
-                                    break;
-                                }
-                                app.results_len -= 1;
-                                let selected = app.results_state.selected();
-                                if selected == app.results_len {
+                                if app.domain == SearchDomain::Clipboard {
+                                    if let Some(entry) = results
+                                        .get(index)
+                                        .and_then(SearchItem::as_clipboard)
+                                        .cloned()
+                                    {
+                                        crate::command::client::clipboard::delete_entry(
+                                            clipboard_database,
+                                            clipboard_store,
+                                            &entry,
+                                        )
+                                        .await?;
+                                        clipboard_search.remove_id(&entry.id);
+                                        results.remove(index);
+                                        clipboard_count = clipboard_count.saturating_sub(1);
+                                        app.set_results_len(results.len(), false);
+                                    }
+                                } else {
+                                    if results.is_empty() {
+                                        break;
+                                    }
+                                    let entry = results
+                                        .remove(index)
+                                        .into_history()
+                                        .expect("history domain contained a clipboard entry");
+                                    app.set_results_len(results.len(), false);
                                     app.inspecting_state.reset();
-                                    app.results_state.select(selected - 1);
+
+                                    let ids = history_store.delete_entries([entry]).await?;
+                                    history_store.build_all(db, &ids).await?;
                                 }
-
-                                let entry = results.remove(index);
-
-                                let ids = history_store.delete_entries([entry]).await?;
-                                history_store.build_all(&db, &ids).await?;
 
                                 app.tab_index  = 0;
                             },
                             InputAction::DeleteAllMatching(index) => {
-                                if results.is_empty() {
-                                    break;
+                                if app.domain == SearchDomain::Clipboard {
+                                    if let Some(content) = results.get(index).map(SearchItem::content).map(str::to_owned) {
+                                        let mut deleted = 0u64;
+                                        loop {
+                                            let batch = clipboard_database
+                                                .active_with_content(&content, 250)
+                                                .await?;
+                                            if batch.is_empty() {
+                                                break;
+                                            }
+                                            let batch_len = batch.len();
+                                            for entry in batch {
+                                                crate::command::client::clipboard::delete_entry(
+                                                    clipboard_database,
+                                                    clipboard_store,
+                                                    &entry,
+                                                )
+                                                .await?;
+                                                deleted += 1;
+                                            }
+                                            if batch_len < 250 {
+                                                break;
+                                            }
+                                            tokio::task::yield_now().await;
+                                        }
+                                        clipboard_search.remove_content(&content);
+                                        results.retain(|item| item.content() != content);
+                                        clipboard_count = clipboard_count.saturating_sub(deleted);
+                                        app.set_results_len(results.len(), false);
+                                        app.inspecting_state.reset();
+                                        app.tab_index = 0;
+                                    }
+                                } else {
+                                    if results.is_empty() {
+                                        break;
+                                    }
+
+                                    let command = results[index].content().to_owned();
+
+                                    // Remove matching entries from the visible results
+                                    results.retain(|entry| entry.content() != command);
+
+                                    // Query the DB for ALL entries with this command and delete them
+                                    let all_matching = db.query_history(
+                                        &format!(
+                                            "select * from history where command = '{}' and deleted_at is null",
+                                            command.replace('\'', "''")
+                                        )
+                                    ).await?;
+
+                                    let ids = history_store.delete_entries(all_matching).await?;
+                                    history_store.build_all(db, &ids).await?;
+
+                                    app.results_len = results.len();
+                                    app.results_state = ListState::default();
+                                    app.inspecting_state.reset();
+                                    app.tab_index = 0;
                                 }
-
-                                let command = results[index].command.clone();
-
-                                // Remove matching entries from the visible results
-                                results.retain(|e| e.command != command);
-
-                                // Query the DB for ALL entries with this command and delete them
-                                let all_matching = db.query_history(
-                                    &format!(
-                                        "select * from history where command = '{}' and deleted_at is null",
-                                        command.replace('\'', "''")
-                                    )
-                                ).await?;
-
-                                let ids = history_store.delete_entries(all_matching).await?;
-                                history_store.build_all(&db, &ids).await?;
-
-                                app.results_len = results.len();
-                                app.results_state = ListState::default();
-                                app.inspecting_state.reset();
-                                app.tab_index = 0;
                             },
                             InputAction::SwitchContext(index) => {
-                                if let Some(index) = index && let Some(entry) = results.get(index) {
-                                    app.search.custom_context = Some(entry.id.clone());
-                                    app.search.context = Context::from_history(entry);
-                                    app.search.filter_mode = FilterMode::Session;
-                                    app.search.input = Cursor::from(String::new());
-                                    app.results_state = ListState::default();
+                                if app.domain == SearchDomain::History {
+                                    if let Some(index) = index
+                                        && let Some(entry) = results
+                                            .get(index)
+                                            .and_then(SearchItem::as_history)
+                                    {
+                                        app.search.custom_context = Some(entry.id.clone());
+                                        app.search.context = Context::from_history(entry);
+                                        app.search.filter_mode = FilterMode::Session;
+                                        app.search.input = Cursor::from(String::new());
+                                        app.results_state = ListState::default();
+                                        app.context_active = true;
+                                    } else {
+                                        app.search.custom_context = None;
+                                        app.search.context = initial_context.clone();
+                                        app.search.filter_mode = default_filter_mode;
+                                        app.context_active = false;
+                                    }
+                                } else if let Some(index) = index {
+                                    if let Some(entry) = results
+                                        .get(index)
+                                        .and_then(SearchItem::as_clipboard)
+                                    {
+                                        app.search.context.hostname.clone_from(&entry.hostname);
+                                        app.search.filter_mode = FilterMode::Host;
+                                        app.context_active = true;
+                                    }
                                 } else {
-                                    app.search.custom_context = None;
                                     app.search.context = initial_context.clone();
-                                    app.search.filter_mode = default_filter_mode;
+                                    app.search.filter_mode = FilterMode::Global;
+                                    app.context_active = false;
                                 }
                             },
                             InputAction::Redraw => {
@@ -1909,8 +2207,76 @@ pub async fn history(
                                     terminal.clear()?;
                                 }
                                 terminal.draw(|f| {
-                                    app.draw(f, &results, stats.clone(), inspecting.as_ref(), settings, theme, popup_mode);
+                                    app.draw(
+                                        f,
+                                        &results,
+                                        clipboard_count,
+                                        stats.clone(),
+                                        inspecting.as_ref(),
+                                        settings,
+                                        theme,
+                                        popup_mode,
+                                    );
                                 })?;
+                            },
+                            InputAction::SwitchDomain => {
+                                app.switch_domain();
+                                break;
+                            },
+                            InputAction::Copy(index)
+                                if app.domain == SearchDomain::Clipboard =>
+                            {
+                                if let Some(entry) = results
+                                    .get(index)
+                                    .and_then(SearchItem::as_clipboard)
+                                {
+                                    let mut backend = ArboardBackend::new()?;
+                                    crate::command::client::clipboard::restore_entry(
+                                        &mut backend,
+                                        entry,
+                                    )?;
+                                }
+                            },
+                            InputAction::Accept(index)
+                                if app.domain == SearchDomain::Clipboard =>
+                            {
+                                if !app.accept {
+                                    accept = false;
+                                    break 'render InputAction::Accept(index);
+                                }
+                                if let Some(entry) = results
+                                    .get(index)
+                                    .and_then(SearchItem::as_clipboard)
+                                {
+                                    let mut backend = ArboardBackend::new()?;
+                                    crate::command::client::clipboard::restore_entry(
+                                        &mut backend,
+                                        entry,
+                                    )?;
+                                }
+                                accept = false;
+                                break 'render InputAction::ReturnOriginal;
+                            },
+                            InputAction::AcceptInspecting
+                                if app.domain == SearchDomain::Clipboard =>
+                            {
+                                if let Some(entry) =
+                                    results
+                                        .get(app.results_state.selected())
+                                        .and_then(SearchItem::as_clipboard)
+                                {
+                                    if !app.accept {
+                                        accept = false;
+                                        break 'render InputAction::AcceptInspecting;
+                                    }
+                                    let mut backend = ArboardBackend::new()?;
+                                    crate::command::client::clipboard::restore_entry(
+                                        &mut backend,
+                                        entry,
+                                    )?;
+                                }
+                                accept = false;
+                                break 'render InputAction::ReturnOriginal;
                             },
                             r => {
                                 accept = app.accept;
@@ -1930,27 +2296,48 @@ pub async fn history(
             }
         }
 
-        if initial_input != app.search.input.as_str()
+        let domain_changed = initial_domain != app.domain;
+        let search_changed = initial_input != app.search.input.as_str()
             || initial_filter_mode != app.search.filter_mode
             || initial_search_mode != app.search_mode
             || initial_custom_context != app.search.custom_context
-        {
-            results = app.query_results(&mut db, settings.smart_sort).await?;
+            || initial_context_active != app.context_active;
+        if domain_changed || search_changed {
+            if domain_changed && app.domain == SearchDomain::Clipboard {
+                clipboard_search.refresh(clipboard_database).await?;
+                clipboard_count = clipboard_database.count_active().await?;
+            }
+            results = app
+                .query_active_results(
+                    db,
+                    clipboard_database,
+                    &mut clipboard_search,
+                    settings.smart_sort,
+                    !domain_changed,
+                )
+                .await?;
         }
 
         // In custom context mode, when no filter is applied, highlight the entry which was used
         // to enter the context when changing modes. This helps to find your way around.
-        if app.search.custom_context.is_some()
+        if app.domain == SearchDomain::History
+            && app.search.custom_context.is_some()
             && app.search.input.as_str().is_empty()
             && (initial_custom_context != app.search.custom_context
                 || initial_filter_mode != app.search.filter_mode)
             && let Some(history_id) = app.search.custom_context.clone()
-            && let Some(pos) = results.iter().position(|entry| entry.id == history_id)
+            && let Some(pos) = results.iter().position(|entry| {
+                entry
+                    .as_history()
+                    .is_some_and(|history| history.id == history_id)
+            })
         {
             app.results_state.select(pos);
         }
 
-        let inspecting_id = app.inspecting_state.clone().current;
+        let inspecting_id = (app.domain == SearchDomain::History)
+            .then(|| app.inspecting_state.clone().current)
+            .flatten();
         // If inspecting ID is not the current inspecting History, update it.
         match inspecting_id {
             Some(inspecting_id) => {
@@ -1963,14 +2350,17 @@ pub async fn history(
             }
         }
 
-        stats = if app.tab_index == 0 {
+        stats = if app.domain == SearchDomain::Clipboard || app.tab_index == 0 {
             None
         } else if !results.is_empty() {
             // If we have stats, then we can indicate next available IDs. This avoids passing
             // around a database object, or a full stats object.
             let selected = match inspecting.clone() {
                 Some(insp) => insp,
-                None => results[app.results_state.selected()].clone(),
+                None => results[app.results_state.selected()]
+                    .as_history()
+                    .cloned()
+                    .expect("history domain contained a clipboard entry"),
             };
             let stats = db.stats(&selected).await?;
             app.inspecting_state.current = Some(selected.id);
@@ -2015,6 +2405,12 @@ pub async fn history(
 
     match result {
         InputAction::AcceptInspecting => {
+            if app.domain == SearchDomain::Clipboard {
+                return Ok(results
+                    .get(app.results_state.selected())
+                    .and_then(SearchItem::as_clipboard)
+                    .map_or_else(String::new, |entry| entry.content.clone()));
+            }
             match inspecting {
                 Some(result) => {
                     let mut command = result.command;
@@ -2030,7 +2426,14 @@ pub async fn history(
             }
         }
         InputAction::Accept(index) if index < results.len() => {
-            let mut command = results.swap_remove(index).command;
+            let item = results.swap_remove(index);
+            if let SearchItem::Clipboard(entry) = item {
+                return Ok(entry.content);
+            }
+            let SearchItem::History(history) = item else {
+                unreachable!()
+            };
+            let mut command = history.command;
 
             if is_command_chaining {
                 command = format!("{} {}", original_query.trim_end(), command);
@@ -2043,8 +2446,8 @@ pub async fn history(
         }
         InputAction::ReturnOriginal => Ok(String::new()),
         InputAction::Copy(index) => {
-            let cmd = results.swap_remove(index).command;
-            if let Err(e) = set_clipboard(cmd) {
+            let content = results.swap_remove(index).content().to_owned();
+            if let Err(e) = set_clipboard(content) {
                 tracing::warn!(?e, "failed to copy to clipboard");
             }
             Ok(String::new())
@@ -2057,6 +2460,7 @@ pub async fn history(
         }
         InputAction::Continue
         | InputAction::Redraw
+        | InputAction::SwitchDomain
         | InputAction::Delete(_)
         | InputAction::DeleteAllMatching(_)
         | InputAction::SwitchContext(_) => {
@@ -2094,12 +2498,33 @@ mod tests {
     use atuin_client::settings::{
         FilterMode, KeymapMode, Preview, PreviewStrategy, SearchMode, Settings,
     };
+    use atuin_client::theme::ThemeManager;
+    use atuin_clipboard::ClipboardEntry;
+    use ratatui::{Terminal, backend::TestBackend};
     use time::OffsetDateTime;
 
     use crate::command::client::search::engines::{self, SearchState};
     use crate::command::client::search::history_list::ListState;
 
-    use super::{Compactness, InspectingState, KeymapSet, State};
+    use super::{
+        Compactness, Cursor, InspectingState, KeymapSet, SearchDomain, SearchItem, SearchScope,
+        State,
+    };
+
+    fn test_scope() -> SearchScope {
+        SearchScope {
+            filter_mode: FilterMode::Global,
+            context: Context {
+                session: String::new(),
+                cwd: String::new(),
+                hostname: String::new(),
+                host_id: String::new(),
+                git_root: None,
+            },
+            custom_context: None,
+            context_active: false,
+        }
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -2160,7 +2585,10 @@ mod tests {
             .build()
             .into();
 
-        let results: Vec<History> = vec![cmd_60, cmd_124, cmd_200];
+        let results: Vec<SearchItem> = vec![cmd_60, cmd_124, cmd_200]
+            .into_iter()
+            .map(SearchItem::from)
+            .collect();
 
         // the selected command does not require a preview
         let no_preview = State::calc_preview_height(
@@ -2273,6 +2701,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2329,6 +2760,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2448,6 +2882,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2507,6 +2944,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2562,6 +3002,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2613,6 +3056,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2677,6 +3123,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2742,6 +3191,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,
@@ -2765,6 +3217,135 @@ mod tests {
         };
         state.results_state.select(selected);
         state
+    }
+
+    #[test]
+    fn switching_domains_preserves_shared_ui_state_and_query() {
+        let mut state = make_executor_state(12, 4);
+        state.search.input = Cursor::from("history query".to_owned());
+        state.search.filter_mode = FilterMode::Session;
+        state.context_active = true;
+        state.tab_index = 1;
+
+        state.switch_domain();
+        state.set_results_len(3, false);
+        assert_eq!(state.domain, SearchDomain::Clipboard);
+        assert_eq!(state.search.input.as_str(), "history query");
+        assert_eq!(state.results_len, 3);
+        assert_eq!(state.results_state.selected(), 2);
+        assert_eq!(state.tab_index, 1);
+        assert_eq!(state.search.filter_mode, FilterMode::Global);
+
+        state.switch_domain();
+        assert_eq!(state.domain, SearchDomain::History);
+        assert_eq!(state.search.input.as_str(), "history query");
+        assert_eq!(state.tab_index, 1);
+        assert_eq!(state.search.filter_mode, FilterMode::Session);
+        assert!(state.context_active);
+    }
+
+    #[test]
+    fn clipboard_enter_tab_numeric_and_escape_have_domain_semantics() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings {
+            enter_accept: false,
+            exit_mode: atuin_client::settings::ExitMode::ReturnQuery,
+            ..Settings::utc()
+        };
+        let mut state = make_executor_state(10, 2);
+        state.domain = SearchDomain::Clipboard;
+        state.keymaps = KeymapSet::defaults(&settings);
+
+        let enter = state.handle_key_input(
+            &settings,
+            &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(enter, super::InputAction::Accept(2)));
+        assert!(state.accept);
+
+        state.accept = false;
+        let tab =
+            state.handle_key_input(&settings, &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(tab, super::InputAction::Accept(2)));
+        assert!(!state.accept);
+
+        state.keymap_mode = KeymapMode::VimNormal;
+        let numeric = state.handle_key_input(
+            &settings,
+            &KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE),
+        );
+        assert!(matches!(numeric, super::InputAction::Accept(5)));
+        assert!(!state.accept);
+
+        let escape =
+            state.handle_key_input(&settings, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(escape, super::InputAction::ReturnOriginal));
+    }
+
+    #[test]
+    fn clipboard_escape_respects_vim_insert_mode_after_domain_switch() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let settings = Settings {
+            keymap_mode: KeymapMode::VimInsert,
+            ..Settings::utc()
+        };
+        let mut state = make_executor_state(10, 2);
+        state.keymap_mode = KeymapMode::VimInsert;
+        state.keymaps = KeymapSet::defaults(&settings);
+
+        state.switch_domain();
+        assert_eq!(state.domain, SearchDomain::Clipboard);
+        assert_eq!(state.keymap_mode, KeymapMode::VimInsert);
+
+        let enter_normal =
+            state.handle_key_input(&settings, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(enter_normal, super::InputAction::Continue));
+        assert_eq!(state.keymap_mode, KeymapMode::VimNormal);
+
+        let exit =
+            state.handle_key_input(&settings, &KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(exit, super::InputAction::ReturnOriginal));
+    }
+
+    #[test]
+    fn clipboard_domain_renders_inside_history_search_frame() {
+        let settings = Settings::utc();
+        let mut state = make_executor_state(0, 0);
+        state.domain = SearchDomain::Clipboard;
+        state.results_len = 1;
+        let entry = ClipboardEntry::new("clipboard payload".to_owned(), "test-host".to_owned());
+        let mut manager = ThemeManager::new(Some(true), Some(String::new()));
+        let theme = manager.load_theme("(none)", None);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let item = SearchItem::from(entry.clone());
+                state.draw(
+                    frame,
+                    std::slice::from_ref(&item),
+                    1,
+                    None,
+                    None,
+                    &settings,
+                    theme,
+                    false,
+                );
+            })
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("CLIP:GLOBAL"));
+        assert!(rendered.contains("clipboard payload"));
     }
 
     #[test]
@@ -3180,6 +3761,9 @@ mod tests {
             tab_index: 0,
             pending_vim_key: None,
             original_input_empty: false,
+            domain: SearchDomain::History,
+            context_active: false,
+            inactive_scope: test_scope(),
             inspecting_state: InspectingState {
                 current: None,
                 next: None,

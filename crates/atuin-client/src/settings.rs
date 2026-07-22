@@ -29,6 +29,7 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static META_CONFIG: OnceLock<(String, f64)> = OnceLock::new();
 static META_STORE: OnceCell<crate::meta::MetaStore> = OnceCell::const_new();
 
+pub mod clipboard;
 mod dotfiles;
 mod kv;
 pub(crate) mod meta;
@@ -1084,6 +1085,9 @@ pub struct Settings {
     pub daemon: Daemon,
 
     #[serde(default)]
+    pub clipboard: clipboard::Settings,
+
+    #[serde(default)]
     pub search: Search,
 
     #[serde(default)]
@@ -1410,6 +1414,7 @@ impl Settings {
         let record_store_path = data_dir.join("records.db");
         let kv_path = data_dir.join("kv.db");
         let scripts_path = data_dir.join("scripts.db");
+        let clipboard_path = data_dir.join("clipboard.db");
         let ai_sessions_path = data_dir.join("ai_sessions.db");
         let socket_path = atuin_common::utils::runtime_dir().join("atuin.sock");
         let pidfile_path = data_dir.join("atuin-daemon.pid");
@@ -1481,6 +1486,14 @@ impl Settings {
             .set_default("daemon.pidfile_path", pidfile_path.to_str())?
             .set_default("daemon.systemd_socket", false)?
             .set_default("daemon.tcp_port", 8889)?
+            .set_default("clipboard.enabled", false)?
+            .set_default("clipboard.db_path", clipboard_path.to_str())?
+            .set_default("clipboard.poll_interval_ms", 500)?
+            .set_default("clipboard.max_bytes", 262_144)?
+            .set_default("clipboard.retention_days", 0)?
+            .set_default("clipboard.capture_empty", false)?
+            .set_default("clipboard.secrets_filter", true)?
+            .set_default("clipboard.exclude", Vec::<String>::new())?
             .set_default("logs.enabled", true)?
             .set_default("logs.dir", logs_dir.to_str())?
             .set_default("logs.level", "info")?
@@ -1622,6 +1635,7 @@ impl Settings {
             "key_path",
             "daemon.socket_path",
             "daemon.pidfile_path",
+            "clipboard.db_path",
             "logs.dir",
             "logs.search.file",
             "logs.daemon.file",
@@ -1716,6 +1730,7 @@ impl Settings {
 
         // Validate UI settings
         settings.ui.validate()?;
+        settings.clipboard.validate()?;
 
         // Register meta store config for lazy initialization on first access
         META_CONFIG
@@ -1736,11 +1751,12 @@ impl Settings {
     }
 
     pub fn paths_ok(&self) -> bool {
-        let paths: [&Path; 4] = [
+        let paths: [&Path; 5] = [
             self.db_path.as_path(),
             self.record_store_path.as_path(),
             self.key_path.as_path(),
             Path::new(&self.meta.db_path),
+            Path::new(&self.clipboard.db_path),
         ];
         paths.iter().all(|p| !utils::broken_symlink(*p))
     }
@@ -1925,6 +1941,7 @@ mod tests {
         let record_store_path: String = config.get("record_store_path")?;
         let kv_db_path: String = config.get("kv.db_path")?;
         let scripts_db_path: String = config.get("scripts.db_path")?;
+        let clipboard_db_path: String = config.get("clipboard.db_path")?;
         let meta_db_path: String = config.get("meta.db_path")?;
         let daemon_socket_path: String = config.get("daemon.socket_path")?;
         let daemon_pidfile_path: String = config.get("daemon.pidfile_path")?;
@@ -1940,6 +1957,10 @@ mod tests {
         assert_eq!(
             scripts_db_path,
             custom_dir.join("scripts.db").to_str().unwrap()
+        );
+        assert_eq!(
+            clipboard_db_path,
+            custom_dir.join("clipboard.db").to_str().unwrap()
         );
         assert_eq!(meta_db_path, custom_dir.join("meta.db").to_str().unwrap());
         assert_eq!(

@@ -220,6 +220,7 @@ dependencies = [
  "async-trait",
  "atuin-ai",
  "atuin-client",
+ "atuin-clipboard",
  "atuin-common",
  "atuin-daemon",
  "atuin-dotfiles",
@@ -392,6 +393,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "atuin-clipboard"
+version = "18.18.0-beta.2"
+dependencies = [
+ "arboard",
+ "async-trait",
+ "atuin-client",
+ "atuin-common",
+ "eyre",
+ "regex",
+ "rmp",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "atuin-common"
 version = "18.18.0-beta.2"
 dependencies = [
@@ -426,6 +447,7 @@ name = "atuin-daemon"
 version = "18.18.0-beta.2"
 dependencies = [
  "atuin-client",
+ "atuin-clipboard",
  "atuin-common",
  "atuin-dotfiles",
  "atuin-history",
@@ -455,6 +477,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "whoami",
 ]
 
 [[package]]

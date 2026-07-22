@@ -14,11 +14,13 @@
 //! - [`semantic::SemanticComponent`]: In-memory semantic command captures
 //! - [`sync::SyncComponent`]: Cloud sync
 
+pub mod clipboard;
 pub mod history;
 pub mod search;
 pub mod semantic;
 pub mod sync;
 
+pub use clipboard::ClipboardComponent;
 pub use history::HistoryComponent;
 pub use search::SearchComponent;
 pub use semantic::SemanticComponent;
